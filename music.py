@@ -4,6 +4,7 @@ import yt_dlp as youtube_dl
 import asyncio
 import re
 from urllib.parse import quote
+import async_timeout
 
 # Set up bot with command prefix
 intents = discord.Intents.default()
@@ -24,6 +25,7 @@ ytdl_format_options = {
     'no_warnings': True,
     'default_search': 'auto',
     'source_address': '0.0.0.0',
+    'extract_flat': 'in_playlist',
     # Add these options to fix audio issues
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
@@ -40,7 +42,7 @@ ytdl_format_options = {
 
 ffmpeg_options = {
     'options': '-vn',
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -loglevel 0'  # Improved reconnect options
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',  # Add this to improve stream stability
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
@@ -52,8 +54,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get('title')
         self.url = data.get('url')
         self.artist = self._extract_artist(data)
-        self.duration = data.get('duration', 0)  # Track duration
-        self.is_live = data.get('is_live', False)  # Check if livestream
     
     @staticmethod
     def _extract_artist(data):
@@ -74,18 +74,26 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
+        
+        # Use async timeout to prevent hanging
         try:
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-            
-            if 'entries' in data:
-                # Take first item from a playlist
-                data = data['entries'][0]
+            async with async_timeout.timeout(30):  # 30 second timeout
+                # Use run_in_executor to prevent blocking the event loop
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+                
+                if data is None:
+                    raise Exception("Could not find any matching songs.")
+                
+                if 'entries' in data:
+                    # Take first item from a playlist
+                    if not data['entries']:
+                        raise Exception("No results found for this query.")
+                    data = data['entries'][0]
 
-            filename = data['url'] if stream else ytdl.prepare_filename(data)
-            return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-        except Exception as e:
-            print(f"Error extracting info: {e}")
-            raise e
+                filename = data['url'] if stream else ytdl.prepare_filename(data)
+                return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        except asyncio.TimeoutError:
+            raise Exception("The search took too long to complete. Please try again.")
 
 
 class Music(commands.Cog):
@@ -94,123 +102,115 @@ class Music(commands.Cog):
         self.queue = {}
         self.now_playing = {}
         self.playing_status = {}
-        self.message_tasks = {}  # To track message tasks
-        self.skip_requested = {}  # Track if skip was requested
-        self.lock = {}  # Locks for each server to prevent race conditions
+        self.play_next_event = {}  # Add an event to synchronize play_next calls
 
-    async def get_lock(self, server_id):
-        """Get or create a lock for a server"""
-        if server_id not in self.lock:
-            self.lock[server_id] = asyncio.Lock()
-        return self.lock[server_id]
-
-    async def delayed_send(self, ctx, message, delay=0.5):
-        """Send a message with a delay to prevent voice lag"""
-        await asyncio.sleep(delay)
-        try:
-            await ctx.send(message)
-        except discord.errors.DiscordException as e:
-            print(f"Error sending message: {e}")
-
-    async def play_next(self, ctx, error=None):
+    async def play_next(self, ctx):
         server_id = ctx.guild.id
-        lock = await self.get_lock(server_id)
         
-        # Use lock to prevent race conditions
-        async with lock:
-            # Check if skip was requested
-            skip_requested = self.skip_requested.get(server_id, False)
-            self.skip_requested[server_id] = False  # Reset skip flag
-            
-            # Log any errors that caused the previous song to end
-            if error and not skip_requested:
-                print(f"Player error caused song to end: {error}")
-                try:
-                    await ctx.send(f"Error playing song: {error}. Trying next song...")
-                except:
-                    pass
-            
+        # Create an event for this server if it doesn't exist
+        if server_id not in self.play_next_event:
+            self.play_next_event[server_id] = asyncio.Event()
+        
+        # Set the event to indicate play_next is currently running
+        self.play_next_event[server_id].set()
+        
+        try:
             # Mark server as not playing at the beginning
             self.playing_status[server_id] = False
+            
+            # Check if voice client still exists and is connected
+            if not ctx.voice_client or not ctx.voice_client.is_connected():
+                if server_id in self.queue:
+                    self.queue[server_id] = []
+                if server_id in self.now_playing:
+                    del self.now_playing[server_id]
+                return
             
             if server_id in self.queue and self.queue[server_id]:
                 # Get next song from queue
                 next_song = self.queue[server_id].pop(0)
                 self.now_playing[server_id] = next_song
                 
-                # Define the after callback (more robust now)
-                def after_playing(e):
-                    # This will run in a different thread, so we need to create a new task
-                    coro = self.play_next(ctx, error=e)
-                    fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
-                    
-                    # Add error handling to the future
-                    def handle_future_error(future):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            print(f"Error in play_next future: {e}")
-                    
-                    fut.add_done_callback(handle_future_error)
-                
                 # Set playing status to True before playing
                 self.playing_status[server_id] = True
                 
-                # Check if voice client is still connected
-                if not ctx.voice_client or not ctx.voice_client.is_connected():
-                    try:
-                        # Try to reconnect
-                        if ctx.author.voice:
-                            channel = ctx.author.voice.channel
-                            await channel.connect()
-                            await asyncio.sleep(0.5)
-                        else:
-                            await self.delayed_send(ctx, "Voice channel no longer available.")
-                            self.playing_status[server_id] = False
-                            return
-                    except discord.errors.ClientException:
-                        await self.delayed_send(ctx, "Could not connect to voice channel.")
-                        self.playing_status[server_id] = False
-                        return
+                # Define what happens when song finishes
+                def after_playing(error):
+                    if error:
+                        print(f"Player error: {error}")
+                    
+                    # Run the play_next coroutine when this song finishes
+                    # Need to use create_task to properly handle errors
+                    asyncio.run_coroutine_threadsafe(
+                        self.play_next(ctx), self.bot.loop)
                 
-                # Start playing the song
-                try:
+                # Play the song with the after callback
+                if ctx.voice_client and ctx.voice_client.is_connected():
                     ctx.voice_client.play(next_song, after=after_playing)
-                    
-                    # Send the message with a slight delay
-                    duration_str = ""
-                    if next_song.duration > 0 and not next_song.is_live:
-                        minutes, seconds = divmod(next_song.duration, 60)
-                        duration_str = f" [{minutes}:{seconds:02d}]"
-                    
-                    message = f"Now playing - {next_song.title} by {next_song.artist}{duration_str}"
-                    task = asyncio.create_task(self.delayed_send(ctx, message))
-                    self.message_tasks[server_id] = task
-                    
-                except Exception as e:
-                    await self.delayed_send(ctx, f"Error starting playback: {str(e)}")
-                    print(f"Playback error: {e}")
-                    # Try the next song
+                    await ctx.send(f"Now playing - {next_song.title} by {next_song.artist}")
+                else:
                     self.playing_status[server_id] = False
-                    await self.play_next(ctx)
-                
             else:
                 # No more songs in queue
                 if server_id in self.now_playing:
                     del self.now_playing[server_id]
-                if server_id in self.playing_status:
-                    del self.playing_status[server_id]
-                    
-                # Send disconnect message with delay and then disconnect
+                self.playing_status[server_id] = False
+                
+                # Only disconnect if there's nothing in the queue
                 if ctx.voice_client and ctx.voice_client.is_connected():
-                    task = asyncio.create_task(self.delayed_send(ctx, "Queue finished. Disconnecting..."))
-                    self.message_tasks[server_id] = task
-                    # Wait before disconnecting
-                    await asyncio.sleep(1.5)
-                    try:
-                        await ctx.voice_client.disconnect()
-                    except:
-                        pass
+                    await ctx.send("Queue is empty. Disconnecting...")
+                    await ctx.voice_client.disconnect()
+        except Exception as e:
+            print(f"Error in play_next: {e}")
+            self.playing_status[server_id] = False
+        finally:
+            # Clear the event to indicate play_next is no longer running
+            self.play_next_event[server_id].clear()
+
+    async def search_youtube_music(self, query):
+        """Search on YouTube Music specifically"""
+        # Format the query to specifically target YouTube Music
+        # Add "audio" to prioritize music over videos
+        formatted_query = f"{query} audio"
+        search_url = f"ytsearch:{formatted_query}"
+        
+        print(f"Searching for: {search_url}")
+        
+        # Extract info with a timeout to prevent hanging
+        try:
+            loop = asyncio.get_event_loop()
+            async with async_timeout.timeout(30):
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(
+                    search_url, download=False, process=False))
+                
+                if not data or not data.get('entries'):
+                    raise Exception("No results found for this query.")
+                
+                # Filter results to prioritize music content
+                entries = data['entries']
+                
+                # Find the first entry that looks like a music track
+                # This is a simple heuristic that can be improved
+                for entry in entries:
+                    video_url = f"https://www.youtube.com/watch?v={entry['id']}"
+                    # Get full info for this specific video
+                    full_data = await loop.run_in_executor(None, lambda: ytdl.extract_info(
+                        video_url, download=False))
+                    
+                    return full_data
+                
+                # If no good match found, just use the first result
+                if entries:
+                    video_url = f"https://www.youtube.com/watch?v={entries[0]['id']}"
+                    return await loop.run_in_executor(None, lambda: ytdl.extract_info(
+                        video_url, download=False))
+                
+                raise Exception("Could not find any suitable music tracks.")
+        except asyncio.TimeoutError:
+            raise Exception("The search took too long to complete. Please try again.")
+        except Exception as e:
+            print(f"Error searching YouTube Music: {e}")
+            raise Exception(f"Error searching: {str(e)}")
 
     @commands.command(name='sing')
     async def sing(self, ctx, *, song_query=None):
@@ -225,26 +225,23 @@ class Music(commands.Cog):
 
         # Connect to voice channel if not already connected
         if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                channel = ctx.author.voice.channel
-                await channel.connect()
-                # Brief pause after connecting to prevent lag
-                await asyncio.sleep(0.5)
-            except discord.errors.ClientException as e:
-                await ctx.send(f"Could not connect to voice channel: {str(e)}")
-                return
+            channel = ctx.author.voice.channel
+            await channel.connect()
 
-        # Search for song on YouTube
-        search_query = quote(song_query)
-        url = f"ytsearch:{search_query}"
+        await ctx.send(f"🔍 Searching for: {song_query}")
         
         async with ctx.typing():
             try:
-                # Let the user know we're searching
-                await ctx.send("Searching for your song...")
+                # Search for song on YouTube Music
+                print(f"Searching for: {song_query}")
+                data = await self.search_youtube_music(song_query)
                 
-                # Get the song
-                player = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True)
+                # Create a player from the found video
+                player = YTDLSource(discord.FFmpegPCMAudio(
+                    data['url'], **ffmpeg_options), data=data)
+                
+                print(f"Found song: {player.title}")
+                
                 server_id = ctx.guild.id
                 
                 # Initialize queue and status for this server if they don't exist
@@ -252,23 +249,26 @@ class Music(commands.Cog):
                     self.queue[server_id] = []
                 if server_id not in self.playing_status:
                     self.playing_status[server_id] = False
-                if server_id not in self.skip_requested:
-                    self.skip_requested[server_id] = False
                 
-                # Add to queue first
-                self.queue[server_id].append(player)
+                # Check if something is already playing
+                is_playing = self.playing_status.get(server_id, False)
+                if ctx.voice_client:
+                    is_playing = is_playing or ctx.voice_client.is_playing()
                 
-                # Get the lock for this server
-                lock = await self.get_lock(server_id)
-                
-                async with lock:
-                    # Check if something is already playing
-                    server_is_playing = self.playing_status.get(server_id, False) or (ctx.voice_client and ctx.voice_client.is_playing())
+                # If something is already playing, add to queue
+                if is_playing:
+                    self.queue[server_id].append(player)
+                    await ctx.send(f"Added to queue: {player.title} by {player.artist}")
+                else:
+                    # Otherwise play immediately
+                    self.queue[server_id].append(player)
                     
-                    if server_is_playing:
-                        await self.delayed_send(ctx, f"Added to queue: {player.title} by {player.artist}")
+                    # Check if play_next is already running
+                    if server_id in self.play_next_event and self.play_next_event[server_id].is_set():
+                        # If so, just wait for it to finish - the song is already in the queue
+                        pass
                     else:
-                        # Play immediately
+                        # Otherwise start playing
                         await self.play_next(ctx)
             except Exception as e:
                 await ctx.send(f"An error occurred: {str(e)}")
@@ -287,26 +287,20 @@ class Music(commands.Cog):
 
         # Connect to voice channel if not already connected
         if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                channel = ctx.author.voice.channel
-                await channel.connect()
-                # Brief pause after connecting to prevent lag
-                await asyncio.sleep(0.5)
-            except discord.errors.ClientException as e:
-                await ctx.send(f"Could not connect to voice channel: {str(e)}")
-                return
+            channel = ctx.author.voice.channel
+            await channel.connect()
 
-        # Search for song on YouTube
-        search_query = quote(song_query)
-        url = f"ytsearch:{search_query}"
+        await ctx.send(f"🔍 Searching for: {song_query}")
         
         async with ctx.typing():
             try:
-                # Let the user know we're searching
-                await ctx.send("Searching for your song...")
+                # Search for song on YouTube Music
+                data = await self.search_youtube_music(song_query)
                 
-                # Get the song
-                player = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True)
+                # Create a player from the found video
+                player = YTDLSource(discord.FFmpegPCMAudio(
+                    data['url'], **ffmpeg_options), data=data)
+                
                 server_id = ctx.guild.id
                 
                 # Initialize queue and status for this server if they don't exist
@@ -314,22 +308,24 @@ class Music(commands.Cog):
                     self.queue[server_id] = []
                 if server_id not in self.playing_status:
                     self.playing_status[server_id] = False
-                if server_id not in self.skip_requested:
-                    self.skip_requested[server_id] = False
                 
                 # Add to queue
                 self.queue[server_id].append(player)
-                await self.delayed_send(ctx, f"Added to queue: {player.title} by {player.artist}")
+                await ctx.send(f"Added to queue: {player.title} by {player.artist}")
                 
-                # Get the lock for this server
-                lock = await self.get_lock(server_id)
+                # Check if something is playing
+                is_playing = self.playing_status.get(server_id, False)
+                if ctx.voice_client:
+                    is_playing = is_playing or ctx.voice_client.is_playing()
                 
-                async with lock:
-                    # Check if something is playing
-                    server_is_playing = self.playing_status.get(server_id, False) or (ctx.voice_client and ctx.voice_client.is_playing())
-                    
-                    # Only start playing if nothing is currently playing
-                    if not server_is_playing:
+                # Only start playing if nothing is currently playing
+                if not is_playing:
+                    # Check if play_next is already running
+                    if server_id in self.play_next_event and self.play_next_event[server_id].is_set():
+                        # If so, just wait for it to finish - the song is already in the queue
+                        pass
+                    else:
+                        # Otherwise start playing
                         await self.play_next(ctx)
             except Exception as e:
                 await ctx.send(f"An error occurred: {str(e)}")
@@ -337,107 +333,86 @@ class Music(commands.Cog):
 
     @commands.command(name='stop')
     async def stop(self, ctx):
-        server_id = ctx.guild.id
-        # Get lock
-        lock = await self.get_lock(server_id)
-        
-        async with lock:
-            if ctx.voice_client:
-                # Clear queue
-                if server_id in self.queue:
-                    self.queue[server_id] = []
-                if server_id in self.now_playing:
-                    del self.now_playing[server_id]
-                if server_id in self.playing_status:
-                    self.playing_status[server_id] = False
-                if server_id in self.skip_requested:
-                    self.skip_requested[server_id] = False
-                
-                # Cancel any pending message tasks
-                if server_id in self.message_tasks and not self.message_tasks[server_id].done():
-                    self.message_tasks[server_id].cancel()
-                
-                # Stop playback
-                if ctx.voice_client.is_playing():
-                    ctx.voice_client.stop()
-                
-                await ctx.send("Music stopped. Disconnecting...")
-                # Wait briefly before disconnecting
-                await asyncio.sleep(0.5)
-                await ctx.voice_client.disconnect()
-            else:
-                await ctx.send("Not connected to a voice channel.")
+        if ctx.voice_client:
+            server_id = ctx.guild.id
+            # Clear queue
+            if server_id in self.queue:
+                self.queue[server_id] = []
+            if server_id in self.now_playing:
+                del self.now_playing[server_id]
+            
+            # Update playing status before disconnecting
+            self.playing_status[server_id] = False
+            
+            # Stop playing and disconnect
+            ctx.voice_client.stop()
+            await ctx.voice_client.disconnect()
+            await ctx.send("Music stopped and queue cleared.")
 
     @commands.command(name='skip')
     async def skip(self, ctx):
         server_id = ctx.guild.id
-        lock = await self.get_lock(server_id)
-        
-        async with lock:
-            if ctx.voice_client and (ctx.voice_client.is_playing() or self.playing_status.get(server_id, False)):
-                await ctx.send("Skipping current song...")
-                # Mark skip as requested to avoid error messages
-                self.skip_requested[server_id] = True
-                
-                # Cancel any pending message tasks
-                if server_id in self.message_tasks and not self.message_tasks[server_id].done():
-                    self.message_tasks[server_id].cancel()
-                
-                # Stop current song (this will trigger play_next)
-                ctx.voice_client.stop()
-            else:
-                await ctx.send("Nothing is playing right now.")
+        # Check if something is playing using our improved status check
+        is_playing = self.playing_status.get(server_id, False)
+        if ctx.voice_client:
+            is_playing = is_playing or ctx.voice_client.is_playing()
+            
+        if is_playing:
+            # Update playing status before stopping
+            self.playing_status[server_id] = False
+            ctx.voice_client.stop()  # This will trigger the after function and play the next song
+            await ctx.send("Skipped current song.")
+        else:
+            await ctx.send("Nothing is playing right now.")
 
     @commands.command(name='queue')
     async def queue_list(self, ctx):
         server_id = ctx.guild.id
-        
-        # Show currently playing song
-        current_song = ""
-        if server_id in self.now_playing and self.playing_status.get(server_id, False):
-            current = self.now_playing[server_id]
-            current_song = f"**Now Playing:** {current.title} by {current.artist}\n\n"
-        
-        # Show queue
         if server_id not in self.queue or not self.queue[server_id]:
-            if current_song:
-                await ctx.send(f"{current_song}**Queue is empty.**")
-            else:
-                await ctx.send("The queue is empty.")
+            await ctx.send("The queue is empty.")
             return
             
         queue_list = "\n".join([f"{i+1}. {song.title} by {song.artist}" 
                               for i, song in enumerate(self.queue[server_id])])
-        
-        await ctx.send(f"{current_song}**Current queue:**\n{queue_list}")
+        await ctx.send(f"**Current queue:**\n{queue_list}")
 
     @commands.command(name='nowplaying')
     async def now_playing_cmd(self, ctx):
         server_id = ctx.guild.id
-        if server_id in self.now_playing and self.playing_status.get(server_id, False):
+        # Check if something is playing using our improved status check
+        is_playing = self.playing_status.get(server_id, False)
+        if ctx.voice_client:
+            is_playing = is_playing or ctx.voice_client.is_playing()
+            
+        if server_id in self.now_playing and is_playing:
             current = self.now_playing[server_id]
-            # Add duration if available
-            duration_str = ""
-            if hasattr(current, 'duration') and current.duration > 0 and not current.is_live:
-                minutes, seconds = divmod(current.duration, 60)
-                duration_str = f" [{minutes}:{seconds:02d}]"
-                
-            await ctx.send(f"**Now Playing:** {current.title} by {current.artist}{duration_str}")
+            await ctx.send(f"**Now Playing:** {current.title} by {current.artist}")
         else:
             await ctx.send("Nothing is playing right now.")
+
+    # Add a command to force disconnect and reset state
+    @commands.command(name='reset')
+    async def reset(self, ctx):
+        server_id = ctx.guild.id
+        
+        # Clear all state for this server
+        if server_id in self.queue:
+            self.queue[server_id] = []
+        if server_id in self.now_playing:
+            del self.now_playing[server_id]
+        self.playing_status[server_id] = False
+        
+        # Force disconnect
+        if ctx.voice_client and ctx.voice_client.is_connected():
+            ctx.voice_client.stop()
+            await ctx.voice_client.disconnect()
             
-    @commands.command(name='ping')
-    async def ping(self, ctx):
-        """Check if the bot is responsive"""
-        await ctx.send(f"Pong! Bot latency: {round(self.bot.latency * 1000)}ms")
+        await ctx.send("Bot state reset. All queues cleared and disconnected.")
 
 @bot.event
 async def on_ready():
     print(f'{bot.user.name} has connected to Discord!')
     await bot.add_cog(Music(bot))
-    
-    # Set custom status
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="!sing commands"))
 
-# Replace with your actual Discord bot token
+# Replace with your actual bot token
 bot.run('BOT TOKEN KAMU')
